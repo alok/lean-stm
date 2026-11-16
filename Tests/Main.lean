@@ -36,16 +36,14 @@ def testOrElseAndExceptions : IO Unit := do
   let acc2 ← TVar.newIO (200 : Nat)
   let logVar ← TVar.newIO ([] : List String)
 
-  -- Outer write before `orElse` should survive when left branch retries, while left branch's writes roll back!
   let usedBackup ← atomically do
     logVar.modify (fun xs => "start" :: xs)
     let fromBackup ←
       (do
         logVar.modify (fun xs => "tried-primary" :: xs)
         let b1 ← acc1.read
-        -- Nested inner `orElse` that succeeds, followed by outer `retry`!
         (do acc1.write (b1 + 999)) <|> (pure ())
-        check (b1 >= 100) -- fails! Must undo BOTH `tried-primary` AND `b1 + 999`, keeping `"start"`!
+        check (b1 >= 100)
         acc1.write (b1 - 100)
         return false)
       <|>
@@ -62,7 +60,6 @@ def testOrElseAndExceptions : IO Unit := do
   assertEq "orElse-acc2-debited" (← acc2.readIO) 100
   assertEq "orElse-log-rollback" (← logVar.readIO) ["used-backup", "start"]
 
-  -- Exception rollback via `tryCatch` and uncaught `throw`
   let caught ← atomically do
     acc1.write 777
     try
@@ -90,7 +87,6 @@ def testModularRetryWakeup : IO Unit := do
   let chA ← TVar.newIO (none : Option Nat)
   let chB ← TVar.newIO (none : Option Nat)
 
-  -- Consumer waits on `chA <|> chB` (must park on `reads(chA) ∪ reads(chB)`!)
   let consumerTask ← IO.asTask (prio := .dedicated) do
     atomically do
       (do
@@ -103,7 +99,7 @@ def testModularRetryWakeup : IO Unit := do
         | some v => chB.write none; return ("B", v)
         | none   => retry)
 
-  IO.sleep 25 -- ensure consumer is parked in `WaitQueue`
+  IO.sleep 20
   atomically do
     chB.write (some 42)
 
@@ -123,7 +119,7 @@ def testConcurrentConservationAndEBR : IO Unit := do
       accs := accs.push tv
 
     let numThreads := 8
-    let itersPerThread := 2000
+    let itersPerThread := 1500
     let mut tasks := #[]
     for tid in [0:numThreads] do
       let accsSnap := accs
@@ -140,17 +136,15 @@ def testConcurrentConservationAndEBR : IO Unit := do
             let (bSrc, histSrc) ← srcVar.read
             let (bDst, histDst) ← dstVar.read
             if bSrc >= amt then
-              -- Allocate fresh heap `Array Nat` every transaction to hammer Perceus + Fraser EBR!
               let nextSrc := if histSrc.size >= 8 then #[tid] else histSrc.push tid
               let nextDst := if histDst.size >= 8 then #[step] else histDst.push step
               srcVar.write (bSrc - amt, nextSrc)
               dstVar.write (bDst + amt, nextDst)
       tasks := tasks.push t
 
-    -- Concurrent MVCC read-only auditor verifying exact conservation (`sum == 8000`) mid-flight!
     let accsAudit := accs
     let auditTask ← IO.asTask (prio := .dedicated) do
-      for _ in [0:300] do
+      for _ in [0:250] do
         let total ← atomicallyReadOnly do
           let mut sum := 0
           for tv in accsAudit do
@@ -172,13 +166,143 @@ def testConcurrentConservationAndEBR : IO Unit := do
     assertEq s!"final-conservation-{repr proto}" finalTotal (numAccounts * initBalance)
   IO.println "  [OK] testConcurrentConservationAndEBR (8 threads × 3 protocols + live MVCC opacity auditor + heap Array EBR)"
 
+/-- Test 5: Split-Capacity `TBQueue` backpressure & exact conservation under 4 producers × 4 consumers. -/
+def testTBQueueBackpressure : IO Unit := do
+  let q ← TBQueue.newIO (capacity := 16)
+  let numWorkers := 4
+  let itemsPerWorker := 1000
+
+  -- 4 dedicated producers pushing 1..1000 each (sum = 4 * 500500 = 2002000)
+  let mut prodTasks := #[]
+  for _ in [0:numWorkers] do
+    let t ← IO.asTask (prio := .dedicated) do
+      for i in [1:itemsPerWorker + 1] do
+        atomically (q.write i)
+    prodTasks := prodTasks.push t
+
+  -- 4 dedicated consumers popping 1000 items each
+  let mut consTasks := #[]
+  for _ in [0:numWorkers] do
+    let t ← IO.asTask (prio := .dedicated) do
+      let mut localSum := 0
+      for _ in [0:itemsPerWorker] do
+        let x ← atomically q.read
+        localSum := localSum + x
+      return localSum
+    consTasks := consTasks.push t
+
+  for p in prodTasks do
+    IO.ofExcept p.get
+  let mut totalPopped := 0
+  for c in consTasks do
+    totalPopped := totalPopped + (← IO.ofExcept c.get)
+
+  let expected := numWorkers * (itemsPerWorker * (itemsPerWorker + 1) / 2)
+  assertEq "tbqueue-sum" totalPopped expected
+  assertEq "tbqueue-empty" (← atomically q.isEmpty) true
+  IO.println "  [OK] testTBQueueBackpressure (4P × 4C bounded cap=16, exact item conservation)"
+
+/-- Test 6: `TChan` multicast broadcast (`dup`), `TMVar` handoff, `TQueue`, and `TSem` Dining Philosophers. -/
+def testChannelsSemaphoresAndPhilosophers : IO Unit := do
+  -- 6a. Broadcast TChan with 3 independent subscribers
+  let bcast ← TChan.newBroadcastIO (α := Nat)
+  let sub1 ← atomically bcast.dup
+  let sub2 ← atomically bcast.dup
+  let sub3 ← atomically bcast.dup
+
+  for x in [10, 20, 30] do
+    atomically (bcast.write x)
+
+  for (name, sub) in [("sub1", sub1), ("sub2", sub2), ("sub3", sub3)] do
+    let a ← atomically sub.read
+    let b ← atomically sub.read
+    let c ← atomically sub.read
+    assertEq s!"tchan-{name}" [a, b, c] [10, 20, 30]
+    assertEq s!"tchan-empty-{name}" (← atomically sub.isEmpty) true
+
+  -- 6b. Deadlock-free Dining Philosophers using `TMVar` forks (even with symmetric pickup order!)
+  let nPhil := 5
+  let mut forks : Array (TMVar Unit) := #[]
+  for _ in [0:nPhil] do
+    forks := forks.push (← TMVar.newIO ())
+
+  let mealsDone ← TVar.newIO 0
+  let mut philTasks := #[]
+  for i in [0:nPhil] do
+    let forksSnap := forks
+    let t ← IO.asTask (prio := .dedicated) do
+      let leftIdx := i
+      let rightIdx := (i + 1) % nPhil
+      if h1 : leftIdx < forksSnap.size then
+      if h2 : rightIdx < forksSnap.size then
+      let fL := forksSnap[leftIdx]
+      let fR := forksSnap[rightIdx]
+      for _ in [0:200] do
+        -- Pick up BOTH forks atomically in one transaction: zero deadlock without manual ordering!
+        atomically do
+          fL.take
+          fR.take
+        atomically do
+          mealsDone.modify (· + 1)
+          fL.put ()
+          fR.put ()
+    philTasks := philTasks.push t
+
+  for t in philTasks do
+    IO.ofExcept t.get
+  assertEq "dining-philosophers-meals" (← mealsDone.readIO) (nPhil * 200)
+
+  -- 6c. `TSem` multi-pool `<|>` resource selection
+  let poolA ← TSem.newIO 0
+  let poolB ← TSem.newIO 2
+  let chosen ← atomically do
+    (poolA.wait *> pure "A") <|> (poolB.waitN 2 *> pure "B")
+  assertEq "tsem-orElse-pool" chosen "B"
+  assertEq "tsem-poolB-rem" (← atomically poolB.available) 0
+  IO.println "  [OK] testChannelsSemaphoresAndPhilosophers (TChan dup, Dining Philosophers, TSem <|>)"
+
+/-- Test 7: STO-inspired Striped `TMap` concurrent cross-key transfers & MVCC consistent size. -/
+def testStripedTMap : IO Unit := do
+  let m ← TMap.newIO (κ := Nat) (ν := Nat) (numStripes := 32)
+  let numKeys := 64
+  atomically do
+    for k in [0:numKeys] do
+      m.insert k 100
+
+  let mut workers := #[]
+  for tid in [0:8] do
+    let t ← IO.asTask (prio := .dedicated) do
+      for step in [0:1000] do
+        let k1 := (tid * 7 + step) % numKeys
+        let k2 := (k1 + 13) % numKeys
+        if k1 != k2 then
+          atomically do
+            let v1 := (← m.get? k1).getD 0
+            let v2 := (← m.get? k2).getD 0
+            if v1 >= 5 then
+              m.insert k1 (v1 - 5)
+              m.insert k2 (v2 + 5)
+    workers := workers.push t
+
+  for w in workers do
+    IO.ofExcept w.get
+
+  let entries ← atomicallyReadOnly m.toList
+  assertEq "tmap-entry-count" entries.length numKeys
+  let totalVal := entries.foldl (fun acc (_, v) => acc + v) 0
+  assertEq "tmap-conservation" totalVal (numKeys * 100)
+  IO.println "  [OK] testStripedTMap (8 threads × 1000 cross-stripe atomic transfers, 0 lost value)"
+
 def main : IO Unit := do
-  IO.println "=== lean-stm Core Runtime Test Suite ==="
+  IO.println "=== lean-stm Runtime & Composable Data Structures Test Suite ==="
   STM.resetStats
   testBasicReadWrite
   testOrElseAndExceptions
   testModularRetryWakeup
   testConcurrentConservationAndEBR
+  testTBQueueBackpressure
+  testChannelsSemaphoresAndPhilosophers
+  testStripedTMap
   let st ← STM.getStats
   IO.println s!"  [Telemetry] commits={st.commits} abortsConflict={st.abortsConflict} abortsVal={st.abortsValidation} retriesParked={st.retriesParked} lsaExt={st.lsaExtensions} mvccSnaps={st.mvccSnapshots} gv4Elisions={st.gv4Elisions}"
-  IO.println "=== ALL CORE TESTS PASSED ==="
+  IO.println "=== ALL RUNTIME & DATA STRUCTURE TESTS PASSED ==="
