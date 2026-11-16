@@ -11,3 +11,13 @@ import STM.Data.TBQueue
 import STM.Data.TChan
 import STM.Data.TSem
 import STM.Data.TMap
+import STM.Verify.Attr
+import STM.Verify.Semantics
+import STM.Verify.DeadlockFree
+import STM.Verify.Opacity
+import STM.Verify.TMS2
+import STM.Verify.TL2
+import STM.Verify.NOrec
+import STM.Verify.MVCC
+import STM.Verify.Auto
+import STM.Verify.Examples

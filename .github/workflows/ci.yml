@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-verify-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install elan & Lean toolchain
+        run: |
+          curl https://elan.lean-lang.org/elan-init.sh -sSf | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> $GITHUB_PATH
+
+      - name: Build STM runtime, mechanized proofs, tests & benchmarks
+        run: lake build STM stm-test stm-bench
+
+      - name: Verify zero sorrys in library & formal proofs
+        run: |
+          if grep -rnw "sorry" STM/; then
+            echo "Found sorry in STM/!"
+            exit 1
+          fi
+
+      - name: Execute multi-core runtime & linearizability test suite
+        run: lake exe stm-test
