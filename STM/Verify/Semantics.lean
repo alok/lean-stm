@@ -13,7 +13,7 @@ Formalizes the executable reference model `SpecSTM σ α` of Harris, Marlow, Pey
 2. Accumulated read-set `reads : List Nat`, **retained** across `retry`ing left branches of `orElse`
    so that `(t1 <|> t2)` parks on `reads(t1) ∪ reads(t2)` and validates `t1`'s failure witness!
 
-Every definition is computable and every theorem is proved with zero `sorry`s.
+Every definition is computable and every theorem is completely kernel-verified.
 -/
 
 namespace STM.Verify

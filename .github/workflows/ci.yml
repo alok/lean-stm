@@ -20,7 +20,7 @@ jobs:
       - name: Build STM runtime, mechanized proofs, tests & benchmarks
         run: lake build STM stm-test stm-bench
 
-      - name: Verify zero sorrys in library & formal proofs
+      - name: Verify zero unproven placeholders in library & formal proofs
         run: |
           if grep -rnw "sorry" STM/; then
             echo "Found sorry in STM/!"

@@ -778,16 +778,15 @@ static bool commit_tl2(TxContext& tx) noexcept {
     if (tx.proto == PROTO_TL2_GV1) {
         wv = g_tl2_clock.val.fetch_add(1, std::memory_order_acq_rel) + 1;
     } else {
-        // Safe Post-Lock GV4 CAS Clock:
+        // Safe Post-Lock GV4 CAS Clock (Autoresearch Winner — see EXP-05 in RESEARCH.md):
         // Load `c = g_tl2_clock` AFTER all write locks are held. Try CAS(c, c + 1).
-        // If CAS fails because a concurrent writer already advanced `g_tl2_clock` to `c' > c`
-        // AFTER we acquired our locks, `wv = c'` satisfies `t_lock < t_clock(c')` and `c' > old_ver`!
+        // Elides up to 78.6% of global clock increments at 16 threads, preventing spurious
+        // `rv` invalidations on concurrent readers and writers!
         uint64_t c = g_tl2_clock.val.load(std::memory_order_seq_cst);
         uint64_t expected = c;
         if (g_tl2_clock.val.compare_exchange_strong(expected, c + 1, std::memory_order_seq_cst)) {
             wv = c + 1;
         } else {
-            // `expected` now holds the new clock value `c' >= c + 1` observed after our locks!
             wv = expected;
             stats()->gv4_elisions.fetch_add(1, std::memory_order_relaxed);
         }
